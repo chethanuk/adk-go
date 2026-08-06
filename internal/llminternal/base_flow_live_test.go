@@ -105,8 +105,18 @@ func blockUntilClientCloses(conn *websocket.Conn) {
 // runLiveStacks returns the goroutine stacks still parked inside RunLive's
 // producer/consumer closures, and their count.
 func runLiveStacks() (int, string) {
+	// runtime.Stack silently truncates when the dump outgrows buf, which would
+	// hide leaked goroutines and turn this helper into a false pass. Grow until
+	// the whole dump fits.
 	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
+	var n int
+	for {
+		n = runtime.Stack(buf, true)
+		if n < len(buf) {
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 	var leaked []string
 	for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
 		if strings.Contains(g, "llminternal.(*Flow).RunLive") {
@@ -251,9 +261,71 @@ func TestRunLiveNoGoroutineLeak(t *testing.T) {
 			wantConns: 2,
 		},
 		{
+			// Same connection-loss shape as the case above, but the queued
+			// request carries RealtimeInput rather than Content, so the sender
+			// fails inside SendRealtime — the third errChan send site. Without
+			// its guard the sender strands just as it does for SendContent.
+			name: "realtime sender error after connection loss does not leak",
+			serveConn: func(connNum int, conn *websocket.Conn) {
+				if connNum == 1 {
+					return
+				}
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					if err := conn.WriteMessage(websocket.TextMessage, []byte(serverContentPong)); err != nil {
+						return
+					}
+				}
+			},
+			drive: func(t *testing.T, sess agent.LiveSession, seq iter.Seq2[*session.Event, error], cancel context.CancelFunc) {
+				stop := make(chan struct{})
+				go func() {
+					for range 200 {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						// A fresh Blob per send: SendRealtime fills in an empty
+						// MIMEType, so a shared value would be mutated in place.
+						req := agent.LiveRequest{RealtimeInput: &genai.Blob{
+							Data:     []byte{0x00, 0x01, 0x02, 0x03},
+							MIMEType: "audio/pcm",
+						}}
+						if err := sess.Send(req); err != nil {
+							return
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+				}()
+				sawTurn := false
+				for ev, err := range seq {
+					if err != nil {
+						continue
+					}
+					if ev != nil && ev.LLMResponse.Content != nil && !sawTurn {
+						sawTurn = true
+						close(stop)
+						cancel()
+					}
+				}
+				if !sawTurn {
+					t.Error("never received a model turn for the retried realtime send")
+				}
+			},
+			wantConns: 2,
+		},
+		{
 			// A close frame with a non-resumable code must surface as an error
 			// to the caller and terminate the flow after a single connection.
-			name: "non-resumable error terminates",
+			//
+			// This case passes with or without the errChan guards: the sender
+			// exits through the existing connCtx.Done() arm, so nothing is
+			// stranded. It pins the terminal-path behaviour; it is not a
+			// regression guard for the leak.
+			name: "non-resumable error terminates after one connection",
 			serveConn: func(connNum int, conn *websocket.Conn) {
 				deadline := time.Now().Add(time.Second)
 				_ = conn.WriteControl(websocket.CloseMessage,
