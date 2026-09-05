@@ -231,6 +231,12 @@ func (s *inMemoryService) AppendEvent(ctx context.Context, curSession Session, e
 		return fmt.Errorf("fail to set state on appendEvent: %w", err)
 	}
 
+	// temp: keys are invocation-scoped and must not reach the canonical stored
+	// record: neither the stored event nor the app/user/session state below.
+	// The local session updated above still holds them for the rest of the
+	// invocation.
+	trimmed := trimTempDeltaState(event)
+
 	eventCopy := &Event{
 		ID:             event.ID,
 		InvocationID:   event.InvocationID,
@@ -239,7 +245,7 @@ func (s *inMemoryService) AppendEvent(ctx context.Context, curSession Session, e
 		Branch:         event.Branch,
 		IsolationScope: event.IsolationScope,
 		Actions: EventActions{
-			StateDelta:                 maps.Clone(event.Actions.StateDelta),
+			StateDelta:                 maps.Clone(trimmed.Actions.StateDelta),
 			ArtifactDelta:              maps.Clone(event.Actions.ArtifactDelta),
 			RequestedToolConfirmations: maps.Clone(event.Actions.RequestedToolConfirmations),
 			TransferToAgent:            event.Actions.TransferToAgent,
@@ -258,8 +264,8 @@ func (s *inMemoryService) AppendEvent(ctx context.Context, curSession Session, e
 	// update the in-memory session service
 	stored_session.events = append(stored_session.events, eventCopy)
 	stored_session.updatedAt = event.Timestamp
-	if len(event.Actions.StateDelta) > 0 {
-		appDelta, userDelta, sessionDelta := sessionutils.ExtractStateDeltas(event.Actions.StateDelta)
+	if len(trimmed.Actions.StateDelta) > 0 {
+		appDelta, userDelta, sessionDelta := sessionutils.ExtractStateDeltas(trimmed.Actions.StateDelta)
 		s.updateAppState(appDelta, curSession.AppName())
 		s.updateUserState(userDelta, curSession.AppName(), curSession.UserID())
 		maps.Copy(stored_session.state, sessionDelta)

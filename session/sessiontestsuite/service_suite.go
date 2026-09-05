@@ -1028,12 +1028,14 @@ func RunServiceTests(t *testing.T, opts SuiteOptions, setup func(t *testing.T) s
 		t.Run("temp_state_is_not_persisted", func(t *testing.T) {
 			s := setup(t)
 			s1, _ := s.Create(ctx, &session.CreateRequest{AppName: appName, UserID: "u1"})
-			_ = s.AppendEvent(ctx, s1.Session, &session.Event{
+			if err := s.AppendEvent(ctx, s1.Session, &session.Event{
 				ID:           "event1",
 				Author:       "user",
 				InvocationID: "inv1",
 				Actions:      session.EventActions{StateDelta: map[string]any{"temp:k1": "v1", "sk": "v2"}},
-			})
+			}); err != nil {
+				t.Fatalf("AppendEvent failed: %v", err)
+			}
 
 			got, _ := s.Get(ctx, &session.GetRequest{AppName: appName, UserID: "u1", SessionID: s1.Session.ID()})
 			snap := Snapshot(got.Session)
@@ -1042,6 +1044,25 @@ func RunServiceTests(t *testing.T, opts SuiteOptions, setup func(t *testing.T) s
 			}
 			if snap.State["sk"] != "v2" {
 				t.Errorf("Standard state update missing: got %v", snap.State)
+			}
+
+			// Session state can never hold a temp: key (ExtractStateDeltas drops
+			// them before the merge), so the assertions above cannot fail. The
+			// leak lives one field over, in the persisted event's state delta.
+			if len(snap.Events) != 1 {
+				t.Fatalf("read back %d events, want the 1 appended; the temp: assertions below need it", len(snap.Events))
+			}
+			stored := snap.Events[0]
+			if stored == nil {
+				t.Fatalf("stored event is nil")
+			}
+			for k := range stored.Actions.StateDelta {
+				if strings.HasPrefix(k, session.KeyPrefixTemp) {
+					t.Errorf("temp:k1 leaked into the stored event delta: key %q, delta %v", k, stored.Actions.StateDelta)
+				}
+			}
+			if got := stored.Actions.StateDelta["sk"]; got != "v2" {
+				t.Errorf("non-temp key dropped from the stored event delta: got %v, want %q", stored.Actions.StateDelta, "v2")
 			}
 		})
 	})
