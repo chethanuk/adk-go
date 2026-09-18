@@ -17,6 +17,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log"
@@ -58,6 +59,11 @@ type Config struct {
 	// optional
 	PluginConfig PluginConfig
 	// optional
+	//
+	// AutoCreateSession makes Run and RunLive create the session when
+	// SessionService.Get reports it missing with an error wrapping
+	// session.ErrNotFound, or when the session ID is empty. Any other Get error
+	// is returned as is.
 	AutoCreateSession bool
 
 	// Compaction enables context compaction for the sessions this
@@ -516,7 +522,13 @@ func (r *Runner) getOrCreateSession(ctx context.Context, userID, sessionID strin
 	if err == nil {
 		return getResp.Session, nil
 	}
-	if !r.autoCreateSession {
+	// Create only when Get reports the session missing. Any other error (an
+	// unreachable backend, a cancelled context, a session owned by another
+	// user) is returned: creating on it would hide the real failure or start an
+	// empty session under an ID that may already hold history. An empty ID names
+	// no session yet; every Service rejects it in Get and generates one in
+	// Create, so it still auto-creates.
+	if !r.autoCreateSession || (sessionID != "" && !errors.Is(err, session.ErrNotFound)) {
 		return nil, err
 	}
 	createResp, err := r.sessionService.Create(ctx, &session.CreateRequest{

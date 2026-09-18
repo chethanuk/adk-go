@@ -17,6 +17,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"strings"
@@ -539,6 +540,27 @@ func TestNewInMemory(t *testing.T) {
 	}
 }
 
+var errTransient = errors.New("session backend unavailable")
+
+// getErrSessionService fails Get with getErr when set and counts Create calls.
+type getErrSessionService struct {
+	session.Service
+	getErr  error
+	creates int
+}
+
+func (s *getErrSessionService) Get(ctx context.Context, req *session.GetRequest) (*session.GetResponse, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.Service.Get(ctx, req)
+}
+
+func (s *getErrSessionService) Create(ctx context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
+	s.creates++
+	return s.Service.Create(ctx, req)
+}
+
 func TestRunner_AutoCreateSession(t *testing.T) {
 	t.Parallel()
 
@@ -559,41 +581,91 @@ func TestRunner_AutoCreateSession(t *testing.T) {
 		name              string
 		autoCreateSession bool
 		setupSession      bool
+		getErr            error
+		emptySessionID    bool
 		wantErr           bool
+		wantErrIs         error
+		wantCreates       int
 	}{
 		{
 			name:              "auto_create_true_session_missing",
 			autoCreateSession: true,
 			setupSession:      false,
 			wantErr:           false,
+			wantCreates:       1,
 		},
 		{
 			name:              "auto_create_false_session_missing",
 			autoCreateSession: false,
 			setupSession:      false,
 			wantErr:           true,
+			wantCreates:       0,
 		},
 		{
 			name:              "auto_create_false_session_exists",
 			autoCreateSession: false,
 			setupSession:      true,
 			wantErr:           false,
+			wantCreates:       0,
 		},
 		{
 			name:              "auto_create_true_session_exists",
 			autoCreateSession: true,
 			setupSession:      true,
 			wantErr:           false,
+			wantCreates:       0,
+		},
+		{
+			name:              "auto_create_true_get_transient_error_session_exists",
+			autoCreateSession: true,
+			setupSession:      true,
+			getErr:            errTransient,
+			wantErr:           true,
+			wantErrIs:         errTransient,
+			wantCreates:       0,
+		},
+		{
+			name:              "auto_create_true_get_transient_error_session_missing",
+			autoCreateSession: true,
+			setupSession:      false,
+			getErr:            errTransient,
+			wantErr:           true,
+			wantErrIs:         errTransient,
+			wantCreates:       0,
+		},
+		{
+			name:              "auto_create_true_get_wraps_not_found",
+			autoCreateSession: true,
+			setupSession:      false,
+			getErr:            fmt.Errorf("backend: %w", session.ErrNotFound),
+			wantErr:           false,
+			wantCreates:       1,
+		},
+		{
+			name:              "auto_create_true_empty_session_id",
+			autoCreateSession: true,
+			emptySessionID:    true,
+			wantErr:           false,
+			wantCreates:       1,
+		},
+		{
+			name:              "auto_create_false_get_transient_error",
+			autoCreateSession: false,
+			getErr:            errTransient,
+			wantErr:           true,
+			wantErrIs:         errTransient,
+			wantCreates:       0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
-			sessionService := session.InMemoryService()
+			inner := session.InMemoryService()
 
+			// Set up directly on the inner store so the stub does not count it.
 			if tt.setupSession {
-				_, err := sessionService.Create(ctx, &session.CreateRequest{
+				_, err := inner.Create(ctx, &session.CreateRequest{
 					AppName:   appName,
 					UserID:    userID,
 					SessionID: sessionID,
@@ -602,6 +674,7 @@ func TestRunner_AutoCreateSession(t *testing.T) {
 					t.Fatalf("failed to setup session: %v", err)
 				}
 			}
+			sessionService := &getErrSessionService{Service: inner, getErr: tt.getErr}
 
 			r, err := New(Config{
 				AppName:           appName,
@@ -613,21 +686,32 @@ func TestRunner_AutoCreateSession(t *testing.T) {
 				t.Fatalf("New() error = %v", err)
 			}
 
+			runSessionID := sessionID
+			if tt.emptySessionID {
+				runSessionID = ""
+			}
+
 			msg := &genai.Content{Parts: []*genai.Part{{Text: "hello"}}}
-			gotError := false
-			for _, err := range r.Run(ctx, userID, sessionID, msg, agent.RunConfig{}) {
-				if err != nil {
-					gotError = true
+			var gotErr error
+			for _, err := range r.Run(ctx, userID, runSessionID, msg, agent.RunConfig{}) {
+				if err != nil && gotErr == nil {
+					gotErr = err
 				}
 			}
 
-			if gotError != tt.wantErr {
-				t.Errorf("Runner.Run() error = %v, wantErr %v", gotError, tt.wantErr)
+			if (gotErr != nil) != tt.wantErr {
+				t.Errorf("Runner.Run() error = %v, wantErr %v", gotErr, tt.wantErr)
+			}
+			if tt.wantErrIs != nil && !errors.Is(gotErr, tt.wantErrIs) {
+				t.Errorf("Runner.Run() error = %v, want errors.Is %v", gotErr, tt.wantErrIs)
+			}
+			if sessionService.creates != tt.wantCreates {
+				t.Errorf("SessionService.Create() calls = %d, want %d", sessionService.creates, tt.wantCreates)
 			}
 
 			// If we expected success, verify session exists/persists
-			if !tt.wantErr {
-				_, err = sessionService.Get(ctx, &session.GetRequest{
+			if !tt.wantErr && !tt.emptySessionID {
+				_, err = inner.Get(ctx, &session.GetRequest{
 					AppName:   appName,
 					UserID:    userID,
 					SessionID: sessionID,
